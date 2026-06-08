@@ -1,118 +1,171 @@
-from collections import Counter, deque
-from typing import TYPE_CHECKING, Literal
-from dataclasses import dataclass
+from abc import abstractmethod
+from collections import Counter
+from typing import Union, Optional, Tuple
 
-from .regs import EmuRegs
-if TYPE_CHECKING:
-    from emuit import EmuIt
+from .result import Result
 
 import unicorn as uc
 
 
-@dataclass(frozen=True)
-class UnwindHandler():
-    pc: int
-    sp: int
-    label: str
+class EmuIt(object):
+    def __init__(self, arch, mode, bitness: int):
+        self.bitsize = bitness
+        self.bytesize = bitness // 8
+        self.mu = uc.Uc(arch, mode)
+        self.mapping = []
+        self.reset()
 
-    def __repr__(self):
-        return f"UnwindHandler(pc=0x{self.pc:0X}, sp=0x{self.sp:0X}, label={self.label})"
+    def reset(self):
+        pass
 
+    def parse_argument(self, value: Union[int, str, bytes]):
+        if isinstance(value, int):
+            max_length = self.bitsize
+            if value.bit_length() > max_length:
+                raise ValueError(f'Value {value} is out of {max_length} bits')
 
-class EmuArch(object):
-    UNWIND_MAX_ATTEMPTS = 5
+            return value
 
-    def __init__(self, emu: "EmuIt", uc_architecture: int, uc_mode: int):
-        self._emu: "EmuIt" = emu
-        self._uc_mode = uc_mode
-        self._uc_architecture = uc_architecture
-        self._engine = uc.Uc(uc_architecture, uc_mode)
-        self._regs: EmuRegs = EmuRegs(self)
-        self._unwind_stats: Counter[int] = Counter()
-        self._unwind_stack: deque[UnwindHandler] = deque()
+        if isinstance(value, str):
+            return value.encode('ascii')
 
-    @property
-    def log(self):
-        return self._emu.log
+        return value
 
-    @property
-    def uc_architecture(self):
-        return self._uc_architecture
+    @abstractmethod
+    def _reg_parse(register: str):
+        raise NotImplementedError('Implement _reg_parse')
 
-    @property
-    def uc_mode(self):
-        return self._uc_mode
+    def __setitem__(
+            self,
+            destination: Union[str, int],
+            value: Union[int, str, bytes]):
 
-    @property
-    def endian(self) -> Literal['little', 'big']:
-        return 'big' if self.uc_mode & uc.unicorn_const.UC_MODE_BIG_ENDIAN else 'little' 
+        value = self.parse_argument(value)
+        if isinstance(destination, int):
+            if isinstance(value, int):
+                value = value.to_bytes(self.bytesize, byteorder='little')
 
-    @property
-    def engine(self) -> uc.Uc:
-        return self._engine
+            if not self.query(destination):
+                self.malloc_ex(destination, len(value))
 
-    @property
-    def ptr_size(self) -> int:
-        return self.bitness // 8
+            return self.mu.mem_write(destination, value)
 
-    @property
-    def bitness(self) -> int:
-        if self._uc_mode & uc.unicorn_const.UC_MODE_64:
-            return 64
-        if self._uc_mode & uc.unicorn_const.UC_MODE_32:
-            return 32
-        if self._uc_mode & uc.unicorn_const.UC_MODE_16:
-            return 16
+        if isinstance(value, bytes):
+            buffer = self.malloc(len(value))
+            self.mu.mem_write(buffer, value)
+            value = buffer
 
-        raise ValueError('Invalid bitness specified in unicorn mode')
+        reg_id = self._reg_parse(destination)
+        return self.mu.reg_write(reg_id, value)
 
-    @property
-    def regs(self) -> EmuRegs:
-        return self._regs
+    def __getitem__(
+            self,
+            source: Union[str, slice]):
 
-    def stack_push(self, value: int):
-        if value.bit_count() > self.bitness:
-            raise OverflowError()
+        if isinstance(source, slice):
+            if source.step != 1 and source.step is not None:
+                raise IndexError('step != 1 not supported')
+            if source.start is None or source.stop is None:
+                raise IndexError('range must be limited')
 
-        self.regs.arch_sp -= self.ptr_size
-        self._emu.mem[self.regs.arch_sp] = value
+            length = source.stop - source.start
+            return bytes(self.mu.mem_read(source.start, length))
 
-    def stack_pop(self) -> int:
-        data: bytes = self._emu.mem.read(self.regs.arch_sp, self.ptr_size)
-        self.regs.arch_sp += self.ptr_size
-        return int.from_bytes(data, byteorder=self.endian)
+        reg_id = self._reg_parse(source)
+        return self.mu.reg_read(reg_id)
 
-    def add_unwind_record(self, return_ea: int, sp_value: int, label: str = ''):
-        while len(self._unwind_stack):
-            # Remove previous unwind handlers
-            handler = self._unwind_stack[-1]
-            if sp_value < handler.sp:
-                break
+    def malloc(self, size: int) -> int:
+        return self.malloc_ex(None, size)
 
-            self._unwind_stack.pop()
+    def malloc_ex(self, address: int = None, size: int = 0x100) -> int:
+        def align_low(value: int, border: int = 4096):
+            return (value // border) * border
+        
+        def align_high(value: int, border: int = 4096):
+            return (value // border + 1) * border
+        
+        size = align_high(size)
+        if address is None:
+            if self.mapping:
+                max_address = max(end for _, end in self.mapping)
+            else:
+                max_address = 0
 
-        new_handler = UnwindHandler(return_ea, sp_value, label)
-        self.log.debug(f'add handler: {new_handler}')
-        self._unwind_stack.append(new_handler)
-    
-    def unwind(self):
-        while len(self._unwind_stack):
-            handler = self._unwind_stack.pop()
-            self.log.debug(f'next handler: {handler}')
+            address = align_high(max_address)
+            block = (address, address + size)
+            self.mu.mem_map(address, size)
+            self.mapping.append(block)
+            return address
 
-            if self.regs.arch_sp < handler.sp:
-                self._unwind_stats[handler.pc] += 1
-                if self._unwind_stats[handler.pc] > self.UNWIND_MAX_ATTEMPTS:
-                    self.log.warning(f'maximum count of unwind attempts reached ({self.UNWIND_MAX_ATTEMPTS})')
-                    continue
+        address = align_low(address)
+        block = (address, address + size)
 
-                self.log.info(f'unwind to IP=0x{handler.pc:0X} ({handler.label}), SP=0x{handler.sp:0X}')
-                self.regs.arch_pc = handler.pc
-                self.regs.arch_sp = handler.sp
-                return True
-        return False
+        if not self.mapping:
+            self.mu.mem_map(address, size)
+            self.mapping.append(block)
+            return address
 
-    def stack_init(self, size: int = 1 * 1024 * 1024):
-        base = self._emu.mem.map_anywhere(size)
-        self.log.debug(f'stack allocated at 0x{base:0X}')
-        self.regs.arch_sp = base + (size // 2) & ~0xFF
+        for i, (start, end) in enumerate(self.mapping):
+            if start <= address and (address + size) <= end:
+                raise ValueError(f'Can\'t allocate memory at {address:0X}')
+
+        self.mu.mem_map(address, size)
+        self.mapping.insert(i, block)
+        return address
+
+    def query(self, address: int) -> Optional[Tuple[int, int]]:
+        for _, (start, end) in enumerate(self.mapping):
+            if start <= address <= end:
+                return (start, end)
+
+        return None
+
+    def free(self, address: int) -> None:
+        for _, (start, end) in enumerate(self.mapping):
+            if start <= address <= end:
+                self.mu.mem_unmap(start, end - start)
+                return
+
+        raise ValueError(f'Can\'t free memory at {address:0X}')
+
+    def _hook_mem_write(self, uc, access, address, size, value, user_data):
+        user_data.update([address + offset for offset in range(0, size)])
+
+    def _hook_mem_invalid_write(self, uc, access, address, size, value, user_data):
+        self.malloc_ex(address, 64 * 1024)
+        user_data.update([address + offset for offset in range(0, size)])
+        return True
+
+    def _hook_code(self, uc, address, size, user_data):
+        # print(hex(address), size)
+        pass
+
+    def run(self, start_ea: int, end_ea: int) -> Result:
+        user_data = set()
+        self.mu.hook_add(uc.UC_HOOK_MEM_WRITE,
+                         self._hook_mem_write,
+                         user_data)
+        self.mu.hook_add(uc.UC_HOOK_MEM_WRITE_UNMAPPED,
+                         self._hook_mem_invalid_write,
+                         user_data)
+        self.mu.hook_add(uc.UC_HOOK_CODE,
+                         self._hook_code)
+
+        try:
+            self.mu.emu_start(start_ea, end_ea)
+        except uc.UcError as e:
+            print('EmuIt Error:', e)
+
+        return self._post_processing(user_data)
+
+    def _post_processing(self, entries: set) -> Result:
+        addresses = sorted(entries)
+        chains = Counter()
+
+        for i, ea in enumerate(addresses):
+            if i == 0 or addresses[i] != (addresses[i - 1] + 0x1):
+                current_buffer_ea = ea
+            chains[current_buffer_ea] += 1
+
+        data = {ea: self[ea:ea + size] for ea, size in chains.items()}
+        return Result(data)
